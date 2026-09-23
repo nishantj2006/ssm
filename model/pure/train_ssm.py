@@ -5,6 +5,11 @@ import numpy as np
 import os
 from torch.amp import autocast
 
+import sys
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
+
 # Import your optimized Mamba model
 from single_ssm import PureSSMLanguageModel
 # Tell PyTorch to use faster matrix multiplication
@@ -28,14 +33,17 @@ def train():
     ROOT_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, "../../"))
     DATA_PATH = os.path.join(ROOT_DIR, "data", "train.bin")
     
-# ----------------------------------------------------------------
-    # HYPERPARAMETERS (The "Goldilocks" Balanced Profile)
     # ----------------------------------------------------------------
-    BATCH_SIZE = 8       # A strong batch size to keep the GPU fully fed
-    ACCUM_STEPS = 8      # 8 * 8 = 64 (Perfect Effective Batch Size)
-    SEQ_LEN = 256        # Bumped back up so it has decent short-term memory
-    DIM = 256            # The mathematical sweet spot
-    NUM_LAYERS = 4       # Enough depth to learn grammar, not just spelling
+    # HYPERPARAMETERS (Max Memory Profile: ~44-48 GB VRAM Utilization)
+    # ----------------------------------------------------------------
+    # This configuration maximizes the context window to 512 tokens (2x original)
+    # while utilizing ~44 GB of your 64 GB unified memory without triggering OS swap/OOM.
+    # ----------------------------------------------------------------
+    BATCH_SIZE = 4       # Micro-batch size (4 * 512 tokens = 2,048 tokens per forward pass)
+    ACCUM_STEPS = 4      # 4 * 4 = 16 Effective Batch Size (frequent updates & fast tracking)
+    SEQ_LEN = 512        # 2x longer context window (512 tokens)
+    DIM = 512            # Model dimension (72.5M total parameters)
+    NUM_LAYERS = 8       # 8 layers for deep syntax and long-range semantic representation
     EPOCHS = 20          
     vocab_size = 50304
     
@@ -48,27 +56,56 @@ def train():
     model = PureSSMLanguageModel(vocab_size, DIM, NUM_LAYERS).to(device)
 
     # ---------------------------------------------------------
-    # --- THE MAGIC SPEED BOOST ---
+    # CHECKPOINT RESUME (Build off previous training runs)
     # ---------------------------------------------------------
-    if device == "cuda":
-        print("Compiling model... (The first batch will take a minute or two to start!)")
-        # You can also pass mode="max-autotune" if you want to wait longer for even faster code
-        model = torch.compile(model, mode="max-autotune", fullgraph=True) 
+    start_epoch = 0
+    start_completed_updates = 0
+    CKPT_DIR = "pure_ssm_ckpt"
+    latest_ckpt_path = os.path.join(CKPT_DIR, "latest_checkpoint.pt")
+    
+    if os.path.exists(latest_ckpt_path):
+        print(f"[*] Found checkpoint: {latest_ckpt_path}! Loading weights...")
+        ckpt = torch.load(latest_ckpt_path, map_location=device)
+        if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
+            model.load_state_dict(ckpt['model_state_dict'])
+            start_epoch = ckpt.get('epoch', 0)
+            start_completed_updates = ckpt.get('completed_updates', 0)
+        else:
+            model.load_state_dict(ckpt)
+        print(f"[*] Resumed weights! Starting at Epoch {start_epoch + 1} (update {start_completed_updates})")
+
+    # ---------------------------------------------------------
+    # --- COMPILATION (Safe Triton / TorchInductor Fallback) ---
+    # ---------------------------------------------------------
+    # On Jetson Orin (aarch64), Triton is typically not available,
+    # so eager PyTorch CUDA with TF32 cuBLAS runs directly and reliably.
+    COMPILE = False
+    if COMPILE and device == "cuda":
+        try:
+            import triton
+            print("Attempting torch.compile...")
+            model = torch.compile(model, mode="max-autotune")
+        except Exception as e:
+            print(f"Skipping torch.compile ({e}); running eager PyTorch CUDA.")
+    else:
+        print("Running native PyTorch CUDA execution (optimized TF32 cuBLAS).")
     
     # 3. Calculate Workload
     tokens_per_epoch = len(data)
-    batches_per_epoch = tokens_per_epoch // (BATCH_SIZE * SEQ_LEN * ACCUM_STEPS)
+    micro_batches_per_epoch = tokens_per_epoch // (BATCH_SIZE * SEQ_LEN)
+    updates_per_epoch = max(1, micro_batches_per_epoch // ACCUM_STEPS)
+    total_update_steps = updates_per_epoch * EPOCHS
     
     print(f"Total Model Parameters: {sum(p.numel() for p in model.parameters()):,}")
-    print(f"Total Batches per Epoch: {batches_per_epoch}\n")
+    print(f"Tokens in Dataset:      {tokens_per_epoch:,}")
+    print(f"Micro-batches per Epoch: {micro_batches_per_epoch}")
+    print(f"Optimizer Steps / Epoch: {updates_per_epoch}")
+    print(f"Total Optimizer Steps:   {total_update_steps}\n")
 
-# ---------------------------------------------------------
+    # ---------------------------------------------------------
     # 4. SETUP OPTIMIZER & SCHEDULER (The Custom SSM Tune)
     # ---------------------------------------------------------
     
-    # Standard weight decay filter:
-    # 2D matrices (Linear layers) get decayed. 
-    # 1D tensors (log_A, LayerNorms, Biases) are safely ignored!
     decay_params = [p for n, p in model.named_parameters() if p.requires_grad and p.ndim >= 2]
     no_decay_params = [p for n, p in model.named_parameters() if p.requires_grad and p.ndim < 2]
 
@@ -77,33 +114,33 @@ def train():
         {"params": no_decay_params, "weight_decay": 0.0}
     ]
 
-    # Standard reliable learning rate for custom from-scratch architectures
     max_learning_rate = 6e-4 
 
     optimizer = optim.AdamW(optim_groups, lr=max_learning_rate, betas=(0.9, 0.95), fused=True)
-    
-    total_update_steps = (batches_per_epoch // ACCUM_STEPS) * EPOCHS
     
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer, 
         max_lr=max_learning_rate,        
         total_steps=total_update_steps,
-        pct_start=0.10,                  # Keep the 10% warmup just to be safe with the exp() math
+        pct_start=0.10,                  # 10% warmup
         div_factor=10.0,                 
         final_div_factor=10.0
     )
     # ---------------------------------------------------------
 
     # 5. THE TRAINING LOOP
-    for epoch in range(EPOCHS):
+    import time
+    start_time = time.time()
+    accum_loss = 0.0
+    completed_updates = start_completed_updates
+
+    for epoch in range(start_epoch, EPOCHS):
         model.train()
-        total_loss = 0
-        
-        # Start with a clean slate
+        epoch_loss = 0.0
         optimizer.zero_grad(set_to_none=True)
         
-        for i in range(batches_per_epoch):
-            # Grab data
+        for i in range(micro_batches_per_epoch):
+            step_start = time.time()
             x, y = get_batch(data, SEQ_LEN, BATCH_SIZE, device)
             
             # --- BFLOAT16 Forward Pass ---
@@ -112,40 +149,58 @@ def train():
                 loss = nn.functional.cross_entropy(logits.view(-1, vocab_size), y.view(-1))
                 loss = loss / ACCUM_STEPS
             
-            # --- Backward Pass (NO SCALER NEEDED FOR BFLOAT16) ---
+            # --- Backward Pass ---
             loss.backward()
+            accum_loss += loss.item() * ACCUM_STEPS
+            epoch_loss += loss.item() * ACCUM_STEPS
             
             # --- Gradient Accumulation Update Step ---
             if (i + 1) % ACCUM_STEPS == 0:
-                # 1. Clip Gradients to catch violent math spikes (The Seatbelt)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                
-                # 2. Step Optimizer
                 optimizer.step()
-                
-                # 3. Step Scheduler
                 scheduler.step()
-                
-                # 4. Empty the bucket for the next round
                 optimizer.zero_grad(set_to_none=True)
-            
-            # Track the loss for printing (scale it back up for human reading)
-            total_loss += loss.item() * ACCUM_STEPS
-            
-            # Print an update every 20 true update cycles
-            if (i + 1) % (20 * ACCUM_STEPS) == 0:
-                avg_loss = total_loss / (i + 1)
+                completed_updates += 1
+                
+                step_loss = accum_loss / ACCUM_STEPS
+                accum_loss = 0.0
                 current_lr = scheduler.get_last_lr()[0]
-                print(f"Epoch {epoch+1}/{EPOCHS} | Batch {i+1:5d}/{batches_per_epoch} | Loss: {avg_loss:.4f} | LR: {current_lr:.6f}")
+                elapsed = time.time() - start_time
+                elapsed_min = elapsed / 60.0
+                tokens_processed = (i + 1) * BATCH_SIZE * SEQ_LEN
+                tok_per_sec = tokens_processed / max(1.0, elapsed)
+                
+                print(f"[Update {completed_updates:4d}/{total_update_steps}] "
+                      f"Epoch {epoch+1:2d} ({i+1:4d}/{micro_batches_per_epoch} mbatches) | "
+                      f"Loss: {step_loss:.4f} | LR: {current_lr:.6f} | "
+                      f"Elapsed: {elapsed_min:.2f}m | Speed: {tok_per_sec:.1f} tok/s", flush=True)
+                
+                # --- Periodic Checkpoint (Every 25 updates ~15 minutes) ---
+                if completed_updates % 25 == 0:
+                    os.makedirs("pure_ssm_ckpt", exist_ok=True)
+                    ckpt_file = "pure_ssm_ckpt/latest_checkpoint.pt"
+                    torch.save({
+                        'epoch': epoch + 1,
+                        'completed_updates': completed_updates,
+                        'model_state_dict': model.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'loss': step_loss,
+                    }, ckpt_file)
+                    print(f"[*] Periodic checkpoint saved to {ckpt_file}", flush=True)
         
         # --- THE AUTO-SAVER (End of Epoch) ---
         print(f"\n--- Epoch {epoch+1} Complete ---")
         os.makedirs("pure_ssm_ckpt", exist_ok=True) 
         checkpoint_path = f"pure_ssm_ckpt/mamba_nano_epoch_{epoch+1}.pt"
         
-        # We save ONLY the weights (state_dict) to save storage space
-        torch.save(model.state_dict(), checkpoint_path)
-        print(f"[*] Saved checkpoint to {checkpoint_path}\n")
+        torch.save({
+            'epoch': epoch + 1,
+            'completed_updates': completed_updates,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'loss': epoch_loss / max(1, micro_batches_per_epoch),
+        }, checkpoint_path)
+        print(f"[*] Saved full epoch checkpoint to {checkpoint_path}\n")
 
 if __name__ == "__main__":
     train()

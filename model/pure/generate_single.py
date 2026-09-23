@@ -17,8 +17,8 @@ def generate():
     CKPT_PATH = os.path.join(ROOT_DIR, "pure_ssm_ckpt", "mamba_nano_epoch_5.pt")
     # ----------------------------------
     
-    DIM = 256            
-    NUM_LAYERS = 4       
+    DIM = 512            
+    NUM_LAYERS = 8       
     
     print(f"Loading checkpoint from {CKPT_PATH}...")
     try:
