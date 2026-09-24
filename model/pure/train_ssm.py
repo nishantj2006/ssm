@@ -62,13 +62,13 @@ def train():
     start_completed_updates = 0
     CKPT_DIR = "pure_ssm_ckpt"
     latest_ckpt_path = os.path.join(CKPT_DIR, "latest_checkpoint.pt")
-    
+    ckpt = None
     if os.path.exists(latest_ckpt_path):
         print(f"[*] Found checkpoint: {latest_ckpt_path}! Loading weights...")
-        ckpt = torch.load(latest_ckpt_path, map_location=device)
+        ckpt = torch.load(latest_ckpt_path, map_location=device, weights_only=False)
         if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
             model.load_state_dict(ckpt['model_state_dict'])
-            start_epoch = ckpt.get('epoch', 0)
+            start_epoch = max(0, ckpt.get('epoch', 1) - 1)
             start_completed_updates = ckpt.get('completed_updates', 0)
         else:
             model.load_state_dict(ckpt)
@@ -126,6 +126,20 @@ def train():
         div_factor=10.0,                 
         final_div_factor=10.0
     )
+
+    # Restore optimizer state and fast-forward scheduler if resuming
+    if ckpt and isinstance(ckpt, dict) and 'optimizer_state_dict' in ckpt:
+        try:
+            optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+            print("[*] Restored AdamW optimizer states!")
+        except Exception as e:
+            print(f"[*] Starting fresh optimizer states ({e})")
+            
+    if start_completed_updates > 0:
+        print(f"[*] Fast-forwarding LR scheduler to update {start_completed_updates}...")
+        for _ in range(start_completed_updates):
+            scheduler.step()
+        print(f"[*] Resumed Learning Rate: {scheduler.get_last_lr()[0]:.6f}\n")
     # ---------------------------------------------------------
 
     # 5. THE TRAINING LOOP
@@ -139,7 +153,13 @@ def train():
         epoch_loss = 0.0
         optimizer.zero_grad(set_to_none=True)
         
-        for i in range(micro_batches_per_epoch):
+        start_mbatch = 0
+        if epoch == start_epoch and start_completed_updates > 0:
+            start_mbatch = (start_completed_updates % updates_per_epoch) * ACCUM_STEPS
+            if start_mbatch > 0:
+                print(f"[*] Resuming Epoch {epoch+1} from micro-batch {start_mbatch}/{micro_batches_per_epoch}")
+        
+        for i in range(start_mbatch, micro_batches_per_epoch):
             step_start = time.time()
             x, y = get_batch(data, SEQ_LEN, BATCH_SIZE, device)
             
