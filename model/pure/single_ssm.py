@@ -1,6 +1,13 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import sys
+from pathlib import Path
+
+MODEL_DIR = str(Path(__file__).resolve().parents[1])
+if MODEL_DIR not in sys.path:
+    sys.path.insert(0, MODEL_DIR)
+from ssm_scan import selective_scan
 
 # 1. THE SELECTIVE SSM LAYER
 class SingleHeadSSMLayer(nn.Module):
@@ -15,35 +22,20 @@ class SingleHeadSSMLayer(nn.Module):
         self.C_proj = nn.Linear(dim, dim)
         
         self.norm = nn.LayerNorm(dim, eps=1e-5)
+        self.scan_backend = "auto"
         
     def forward(self, x):
         x_in = x
         x = self.norm(x)
         b, seq, d = x.shape
         
-        A_continuous = -torch.exp(self.log_A) 
         dt = F.softplus(self.dt_proj(x))      
         
         B = self.B_proj(x) 
         C = self.C_proj(x) 
         
-        log_A = dt * A_continuous             
         gated_x = B * x  
-        
-        cumsum_A = torch.cumsum(log_A, dim=1)
-        log_M = cumsum_A.unsqueeze(2) - cumsum_A.unsqueeze(1) 
-        
-        indices = torch.arange(seq, device=x.device)
-        mask = indices[:, None] >= indices[None, :]
-        log_M = log_M.masked_fill(~mask.unsqueeze(0).unsqueeze(-1), float('-inf'))
-        
-        log_M = torch.clamp(log_M, max=20.0)
-
-        M = torch.exp(log_M)
-        state = torch.einsum('b t j d, b j d -> b t d', M, gated_x)
-        
-        out = state * C  
-        return out + x_in
+        return selective_scan(gated_x, C, dt, self.log_A, x_in, self.scan_backend)
 
 # 2. FEED FORWARD NETWORK
 class FeedForward(nn.Module):

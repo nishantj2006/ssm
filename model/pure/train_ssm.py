@@ -44,7 +44,7 @@ def train():
     SEQ_LEN = 512        # 2x longer context window (512 tokens)
     DIM = 512            # Model dimension (72.5M total parameters)
     NUM_LAYERS = 8       # 8 layers for deep syntax and long-range semantic representation
-    EPOCHS = 20          
+    EPOCHS = 4           # 4 full epochs (~11.5 hours, ideal overnight run)
     vocab_size = 50304
     
     # 1. Load the Dataset
@@ -52,15 +52,19 @@ def train():
     raw_data = np.fromfile(DATA_PATH, dtype=np.uint16)
     data = torch.from_numpy(raw_data).long()
     
+    # 2. Calculate Workload
+    tokens_per_epoch = len(data)
+    micro_batches_per_epoch = tokens_per_epoch // (BATCH_SIZE * SEQ_LEN)
+    updates_per_epoch = max(1, micro_batches_per_epoch // ACCUM_STEPS)
+    total_update_steps = updates_per_epoch * EPOCHS
 
     model = PureSSMLanguageModel(vocab_size, DIM, NUM_LAYERS).to(device)
 
     # ---------------------------------------------------------
     # CHECKPOINT RESUME (Build off previous training runs)
     # ---------------------------------------------------------
-    start_epoch = 0
     start_completed_updates = 0
-    CKPT_DIR = "pure_ssm_ckpt"
+    CKPT_DIR = os.path.join(ROOT_DIR, "pure_ssm_ckpt")
     latest_ckpt_path = os.path.join(CKPT_DIR, "latest_checkpoint.pt")
     ckpt = None
     if os.path.exists(latest_ckpt_path):
@@ -68,11 +72,13 @@ def train():
         ckpt = torch.load(latest_ckpt_path, map_location=device, weights_only=False)
         if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
             model.load_state_dict(ckpt['model_state_dict'])
-            start_epoch = max(0, ckpt.get('epoch', 1) - 1)
             start_completed_updates = ckpt.get('completed_updates', 0)
         else:
             model.load_state_dict(ckpt)
-        print(f"[*] Resumed weights! Starting at Epoch {start_epoch + 1} (update {start_completed_updates})")
+            
+    start_epoch = start_completed_updates // updates_per_epoch
+    if ckpt:
+        print(f"[*] Resumed weights! Starting at Epoch {start_epoch + 1} (update {start_completed_updates}/{total_update_steps})")
 
     # ---------------------------------------------------------
     # --- COMPILATION (Safe Triton / TorchInductor Fallback) ---
@@ -89,12 +95,6 @@ def train():
             print(f"Skipping torch.compile ({e}); running eager PyTorch CUDA.")
     else:
         print("Running native PyTorch CUDA execution (optimized TF32 cuBLAS).")
-    
-    # 3. Calculate Workload
-    tokens_per_epoch = len(data)
-    micro_batches_per_epoch = tokens_per_epoch // (BATCH_SIZE * SEQ_LEN)
-    updates_per_epoch = max(1, micro_batches_per_epoch // ACCUM_STEPS)
-    total_update_steps = updates_per_epoch * EPOCHS
     
     print(f"Total Model Parameters: {sum(p.numel() for p in model.parameters()):,}")
     print(f"Tokens in Dataset:      {tokens_per_epoch:,}")
@@ -114,7 +114,12 @@ def train():
         {"params": no_decay_params, "weight_decay": 0.0}
     ]
 
-    max_learning_rate = 6e-4 
+    max_learning_rate = 3e-4
+    if ckpt and isinstance(ckpt, dict) and 'optimizer_state_dict' in ckpt:
+        pgs = ckpt['optimizer_state_dict'].get('param_groups', [])
+        if pgs and 'max_lr' in pgs[0]:
+            max_learning_rate = pgs[0]['max_lr']
+            print(f"[*] Loaded checkpoint max learning rate: {max_learning_rate}")
 
     optimizer = optim.AdamW(optim_groups, lr=max_learning_rate, betas=(0.9, 0.95), fused=True)
     
@@ -122,12 +127,12 @@ def train():
         optimizer, 
         max_lr=max_learning_rate,        
         total_steps=total_update_steps,
-        pct_start=0.10,                  # 10% warmup
+        pct_start=0.08,                  # 8% warmup (~93 steps)
         div_factor=10.0,                 
         final_div_factor=10.0
     )
 
-    # Restore optimizer state and fast-forward scheduler if resuming
+    # Restore optimizer state and scheduler if resuming
     if ckpt and isinstance(ckpt, dict) and 'optimizer_state_dict' in ckpt:
         try:
             optimizer.load_state_dict(ckpt['optimizer_state_dict'])
@@ -135,11 +140,26 @@ def train():
         except Exception as e:
             print(f"[*] Starting fresh optimizer states ({e})")
             
-    if start_completed_updates > 0:
+    if ckpt and isinstance(ckpt, dict) and 'scheduler_state_dict' in ckpt:
+        try:
+            scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+            print("[*] Restored LR scheduler state directly!")
+        except Exception as e:
+            print(f"[*] Fast-forwarding LR scheduler instead ({e})...")
+            if start_completed_updates > 0:
+                import warnings
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    for _ in range(start_completed_updates):
+                        scheduler.step()
+    elif start_completed_updates > 0:
         print(f"[*] Fast-forwarding LR scheduler to update {start_completed_updates}...")
-        for _ in range(start_completed_updates):
-            scheduler.step()
-        print(f"[*] Resumed Learning Rate: {scheduler.get_last_lr()[0]:.6f}\n")
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            for _ in range(start_completed_updates):
+                scheduler.step()
+    print(f"[*] Current Learning Rate: {scheduler.get_last_lr()[0]:.6f}\n")
     # ---------------------------------------------------------
 
     # 5. THE TRAINING LOOP
@@ -187,7 +207,7 @@ def train():
                 current_lr = scheduler.get_last_lr()[0]
                 elapsed = time.time() - start_time
                 elapsed_min = elapsed / 60.0
-                tokens_processed = (i + 1) * BATCH_SIZE * SEQ_LEN
+                tokens_processed = (i + 1 - start_mbatch) * BATCH_SIZE * SEQ_LEN
                 tok_per_sec = tokens_processed / max(1.0, elapsed)
                 
                 print(f"[Update {completed_updates:4d}/{total_update_steps}] "
@@ -195,32 +215,37 @@ def train():
                       f"Loss: {step_loss:.4f} | LR: {current_lr:.6f} | "
                       f"Elapsed: {elapsed_min:.2f}m | Speed: {tok_per_sec:.1f} tok/s", flush=True)
                 
-                # --- Periodic Checkpoint (Every 25 updates ~15 minutes) ---
+                # --- Periodic Checkpoint (Every 25 updates) ---
                 if completed_updates % 25 == 0:
-                    os.makedirs("pure_ssm_ckpt", exist_ok=True)
-                    ckpt_file = "pure_ssm_ckpt/latest_checkpoint.pt"
+                    os.makedirs(CKPT_DIR, exist_ok=True)
+                    ckpt_file = os.path.join(CKPT_DIR, "latest_checkpoint.pt")
                     torch.save({
                         'epoch': epoch + 1,
                         'completed_updates': completed_updates,
                         'model_state_dict': model.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
+                        'scheduler_state_dict': scheduler.state_dict(),
                         'loss': step_loss,
                     }, ckpt_file)
                     print(f"[*] Periodic checkpoint saved to {ckpt_file}", flush=True)
         
         # --- THE AUTO-SAVER (End of Epoch) ---
         print(f"\n--- Epoch {epoch+1} Complete ---")
-        os.makedirs("pure_ssm_ckpt", exist_ok=True) 
-        checkpoint_path = f"pure_ssm_ckpt/mamba_nano_epoch_{epoch+1}.pt"
+        os.makedirs(CKPT_DIR, exist_ok=True) 
+        checkpoint_path = os.path.join(CKPT_DIR, f"mamba_nano_epoch_{epoch+1}.pt")
+        latest_file = os.path.join(CKPT_DIR, "latest_checkpoint.pt")
         
-        torch.save({
+        epoch_ckpt = {
             'epoch': epoch + 1,
             'completed_updates': completed_updates,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
             'loss': epoch_loss / max(1, micro_batches_per_epoch),
-        }, checkpoint_path)
-        print(f"[*] Saved full epoch checkpoint to {checkpoint_path}\n")
+        }
+        torch.save(epoch_ckpt, checkpoint_path)
+        torch.save(epoch_ckpt, latest_file)
+        print(f"[*] Saved full epoch checkpoint to {checkpoint_path} and {latest_file}\n", flush=True)
 
 if __name__ == "__main__":
     train()
