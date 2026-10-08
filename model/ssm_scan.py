@@ -28,6 +28,12 @@ def dense_reference_scan(u, c, dt, log_a, residual):
     return residual + state * c
 
 
+def _tile_shape(length, dim):
+    # CUDA graph measurements on the target Jetson favor more temporal work
+    # per program and narrower channel groups for long, narrow sequences.
+    return (128, 8) if length >= 1024 and dim <= 512 else (64, 16)
+
+
 if triton is not None:
     @triton.jit
     def _compose(a_left, u_left, a_right, u_right):
@@ -65,15 +71,17 @@ if triton is not None:
 
     @triton.jit
     def _scan_backward(C, DT, LOG_A, STATES, GRAD_OUTPUT,
-                       GRAD_U, GRAD_C, GRAD_DT_ELEMENT, GRAD_LOG_A_ELEMENT,
+                       GRAD_U, GRAD_C, GRAD_DT_PARTIAL, GRAD_LOG_A_PARTIAL,
                        T: tl.constexpr, D: tl.constexpr,
                        CHUNK: tl.constexpr, CHANNELS: tl.constexpr):
         batch = tl.program_id(0)
-        channel = tl.program_id(1) * CHANNELS + tl.arange(0, CHANNELS)
+        group = tl.program_id(1)
+        channel = group * CHANNELS + tl.arange(0, CHANNELS)
         row = tl.arange(0, CHUNK)
         good_channel = channel < D
         a_cont = -tl.exp(tl.load(LOG_A + channel, good_channel, other=0).to(tl.float32))
         carry = tl.full((CHANNELS,), 0, tl.float32)
+        grad_log_a_sum = tl.full((CHANNELS,), 0, tl.float32)
 
         for chunk in range(tl.cdiv(T, CHUNK)):
             time = T - 1 - chunk * CHUNK - row
@@ -102,23 +110,32 @@ if triton is not None:
             grad_decay = grad_state * prev_state * a * a_cont[None, :]
             tl.store(GRAD_U + offset, grad_state, good)
             tl.store(GRAD_C + offset, grad * state, good)
-            tl.store(GRAD_DT_ELEMENT + offset, grad_decay, good)
-            tl.store(GRAD_LOG_A_ELEMENT + offset, grad_decay * delta[:, None], good)
+            # Reduce the channel tile here instead of writing two full [B,T,D]
+            # gradient tensors for PyTorch to read back.
+            grad_dt_tile = tl.sum(tl.where(good_channel[None, :], grad_decay, 0.0), axis=1)
+            tl.store(GRAD_DT_PARTIAL + (batch * T + time) * tl.cdiv(D, CHANNELS) + group,
+                     grad_dt_tile, good_time)
+            grad_log_a_sum += tl.sum(tl.where(good_time[:, None],
+                                                grad_decay * delta[:, None], 0.0), axis=0)
+
+        tl.store(GRAD_LOG_A_PARTIAL + batch * D + channel, grad_log_a_sum, good_channel)
 
 
 class _TritonScan(torch.autograd.Function):
     @staticmethod
     def forward(ctx, u, c, dt, log_a, residual):
         batch, length, dim = u.shape
+        chunk, channels = _tile_shape(length, dim)
         u, c, dt, residual = (v.contiguous() for v in (u, c, dt, residual))
         log_a = log_a.contiguous()
         state = torch.empty((batch, length, dim), device=u.device, dtype=torch.float32)
         output = torch.empty_like(residual)
-        _scan_forward[(batch, triton.cdiv(dim, 16))](
+        _scan_forward[(batch, triton.cdiv(dim, channels))](
             u, c, dt, log_a, residual, state, output,
-            length, dim, 64, 16, num_warps=4,
+            length, dim, chunk, channels, num_warps=4,
         )
         ctx.u_dtype = u.dtype
+        ctx.tile_shape = chunk, channels
         ctx.save_for_backward(c, dt, log_a, state)
         return output
 
@@ -126,18 +143,21 @@ class _TritonScan(torch.autograd.Function):
     def backward(ctx, grad_output):
         c, dt, log_a, state = ctx.saved_tensors
         batch, length, dim = state.shape
+        chunk, channels = ctx.tile_shape
         grad_output = grad_output.contiguous()
         grad_u = torch.empty_like(state)
         grad_c = torch.empty_like(state)
-        grad_dt_element = torch.empty_like(state)
-        grad_log_a_element = torch.empty_like(state)
-        _scan_backward[(batch, triton.cdiv(dim, 16))](
+        grad_dt_partial = torch.empty((batch, length, triton.cdiv(dim, channels)),
+                                      device=state.device, dtype=torch.float32)
+        grad_log_a_partial = torch.empty((batch, dim), device=state.device,
+                                         dtype=torch.float32)
+        _scan_backward[(batch, triton.cdiv(dim, channels))](
             c, dt, log_a, state, grad_output,
-            grad_u, grad_c, grad_dt_element, grad_log_a_element,
-            length, dim, 64, 16, num_warps=4,
+            grad_u, grad_c, grad_dt_partial, grad_log_a_partial,
+            length, dim, chunk, channels, num_warps=4,
         )
-        grad_dt = grad_dt_element.sum(dim=-1, keepdim=True).to(dt.dtype)
-        grad_log_a = grad_log_a_element.sum(dim=(0, 1)).to(log_a.dtype)
+        grad_dt = grad_dt_partial.sum(dim=-1, keepdim=True).to(dt.dtype)
+        grad_log_a = grad_log_a_partial.sum(dim=0).to(log_a.dtype)
         return grad_u.to(ctx.u_dtype), grad_c.to(c.dtype), grad_dt, grad_log_a, grad_output
 
 

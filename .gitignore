@@ -17,3 +17,6 @@ __pycache__/
 *.bin
 *.bak
 *ckpt*/
+data/fineweb_10bt*/
+.deps/
+.cache/

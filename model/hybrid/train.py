@@ -26,19 +26,19 @@ def train():
     print(f"--- Firing up OPTIMIZED HYBRID SSM+ATTENTION training on {device.upper()} ---")
 
     DATA_PATH = os.path.join(ROOT_DIR, "data", "train.bin")
-    CKPT_DIR = os.path.join(ROOT_DIR, "hybrid_ssm_ckpt")
+    CKPT_DIR = os.environ.get("SSM_CKPT_DIR", os.path.join(ROOT_DIR, "hybrid_ssm_ckpt"))
     os.makedirs(CKPT_DIR, exist_ok=True)
 
     # ----------------------------------------------------------------
-    # HYPERPARAMETERS (Max Memory Profile: ~48-50 GB VRAM Utilization)
+    # HYPERPARAMETERS
     # ----------------------------------------------------------------
     # Matched 1:1 with Pure SSM for head-to-head architectural A/B comparison
     # ----------------------------------------------------------------
-    BATCH_SIZE = 4       # Micro-batch size (4 * 512 tokens = 2,048 tokens per forward pass)
-    ACCUM_STEPS = 4      # Effective Batch Size = 16 (frequent updates & fast tracking)
+    BATCH_SIZE = int(os.environ.get("SSM_BATCH_SIZE", "4"))
+    ACCUM_STEPS = int(os.environ.get("SSM_ACCUM_STEPS", "4"))
     SEQ_LEN = 512        # 512 tokens context window
-    DIM = 512            # Model dimension (73.6M total parameters)
-    NUM_LAYERS = 8       # 8 layers total (6 Selective SSM layers + 2 RoPE Attention anchors)
+    DIM = int(os.environ.get("SSM_DIM", "512"))
+    NUM_LAYERS = int(os.environ.get("SSM_LAYERS", "8"))
     ATTN_LAYERS = (2, 5) # Inward anchors: Layers 3 & 6 (0-indexed 2 and 5), keeping Layers 7 & 8 as SSM
     EPOCHS = 8           # Extended to 8 full epochs (Epochs 5-8 continuation)
     vocab_size = 50304
@@ -61,6 +61,9 @@ def train():
         num_layers=NUM_LAYERS,
         attn_layers=ATTN_LAYERS
     ).to(device)
+    model.gradient_checkpointing = os.environ.get("SSM_CHECKPOINT_BLOCKS", "0") == "1"
+    if model.gradient_checkpointing:
+        print("Block activation checkpointing enabled")
 
     # 3. Checkpoint Resume Engine
     start_completed_updates = 0
@@ -101,7 +104,16 @@ def train():
             max_learning_rate = pgs[0]['max_lr']
             print(f"[*] Loaded checkpoint max learning rate: {max_learning_rate}")
 
-    optimizer = optim.AdamW(optim_groups, lr=max_learning_rate, betas=(0.9, 0.95), fused=True)
+    optimizer_name = os.environ.get("SSM_OPTIMIZER", "adamw").lower()
+    if optimizer_name not in ("adamw", "adafactor"):
+        raise ValueError("SSM_OPTIMIZER must be 'adamw' or 'adafactor'")
+    if ckpt and isinstance(ckpt, dict) and ckpt.get("optimizer_name", "adamw") != optimizer_name:
+        raise ValueError("Checkpoint optimizer differs from SSM_OPTIMIZER; use a new SSM_CKPT_DIR")
+    if optimizer_name == "adafactor":
+        optimizer = optim.Adafactor(optim_groups, lr=max_learning_rate)
+    else:
+        optimizer = optim.AdamW(optim_groups, lr=max_learning_rate, betas=(0.9, 0.95), fused=True)
+    print(f"Optimizer: {optimizer_name}")
 
     INITIAL_BUDGET = 1164
     extending_run = start_completed_updates >= INITIAL_BUDGET
@@ -111,7 +123,7 @@ def train():
         if ckpt and isinstance(ckpt, dict) and 'optimizer_state_dict' in ckpt:
             try:
                 optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-                print("[*] Restored AdamW optimizer states!")
+                print(f"[*] Restored {optimizer_name} optimizer states!")
             except Exception as e:
                 print(f"[*] Starting fresh optimizer states ({e})")
 
@@ -147,13 +159,14 @@ def train():
             total_steps=INITIAL_BUDGET,
             pct_start=0.08,
             div_factor=10.0,
-            final_div_factor=10.0
+            final_div_factor=10.0,
+            cycle_momentum=optimizer_name == "adamw",
         )
 
         if ckpt and isinstance(ckpt, dict) and 'optimizer_state_dict' in ckpt:
             try:
                 optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-                print("[*] Restored AdamW optimizer states!")
+                print(f"[*] Restored {optimizer_name} optimizer states!")
             except Exception as e:
                 print(f"[*] Starting fresh optimizer states ({e})")
 
@@ -237,6 +250,7 @@ def train():
                         'epoch': epoch + 1,
                         'completed_updates': completed_updates,
                         'model_state_dict': model.state_dict(),
+                        'optimizer_name': optimizer_name,
                         'optimizer_state_dict': optimizer.state_dict(),
                         'scheduler_state_dict': scheduler.state_dict(),
                         'loss': step_loss,
@@ -252,6 +266,7 @@ def train():
             'epoch': epoch + 1,
             'completed_updates': completed_updates,
             'model_state_dict': model.state_dict(),
+            'optimizer_name': optimizer_name,
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
             'loss': epoch_loss / max(1, micro_batches_per_epoch),

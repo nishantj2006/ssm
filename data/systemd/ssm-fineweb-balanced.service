@@ -1,0 +1,14 @@
+[Unit]
+Description=343M pure SSM FineWeb four-pass training and evaluation
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=/mnt/ssd/ssm
+ExecStart=/usr/bin/python3 /mnt/ssd/ssm/data/supervise_fineweb_balanced.py
+Restart=on-failure
+RestartSec=300
+TimeoutStopSec=120
+
+[Install]
+WantedBy=default.target

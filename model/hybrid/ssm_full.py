@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 import sys
 from pathlib import Path
 
@@ -139,6 +140,7 @@ class HybridLanguageModel(nn.Module):
     def __init__(self, vocab_size, dim, num_layers=8, attn_layers=None, attn_every=None):
         super().__init__()
         self.dim = dim
+        self.gradient_checkpointing = False
         self.embedding = nn.Embedding(vocab_size, dim)
         
         # Inward anchors: By default, place attention at Layers 3 and 6 (indices 2 and 5)
@@ -161,7 +163,10 @@ class HybridLanguageModel(nn.Module):
     def forward(self, input_ids):
         x = self.embedding(input_ids)
         for layer in self.layers:
-            x = layer(x)
+            if self.training and self.gradient_checkpointing:
+                x = checkpoint(layer, x, use_reentrant=False)
+            else:
+                x = layer(x)
         x = self.final_norm(x)
         logits = self.classifier(x)
         return logits

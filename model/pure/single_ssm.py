@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 import sys
 from pathlib import Path
 
@@ -69,6 +70,7 @@ class PureSSMLanguageModel(nn.Module):
     def __init__(self, vocab_size, dim, num_layers=6):
         super().__init__()
         self.dim = dim
+        self.gradient_checkpointing = False
         self.embedding = nn.Embedding(vocab_size, dim)
         
         # Every single layer is now an SSM. Zero Attention.
@@ -79,10 +81,14 @@ class PureSSMLanguageModel(nn.Module):
         self.final_norm = nn.LayerNorm(dim)
         self.classifier = nn.Linear(dim, vocab_size, bias=False)
 
-    def forward(self, input_ids):
+    def forward_hidden(self, input_ids):
         x = self.embedding(input_ids)
         for layer in self.layers:
-            x = layer(x)
-        x = self.final_norm(x)
-        logits = self.classifier(x)
-        return logits
+            if self.training and self.gradient_checkpointing:
+                x = checkpoint(layer, x, use_reentrant=False)
+            else:
+                x = layer(x)
+        return self.final_norm(x)
+
+    def forward(self, input_ids):
+        return self.classifier(self.forward_hidden(input_ids))

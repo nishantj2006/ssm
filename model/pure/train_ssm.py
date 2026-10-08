@@ -16,11 +16,10 @@ from single_ssm import PureSSMLanguageModel
 torch.set_float32_matmul_precision('high')
 
 def get_batch(data, seq_len, batch_size, device):
-    # Random sampling with replacement (This is how it learns the whole file!)
-    ix = torch.randint(len(data) - seq_len, (batch_size,))
-    x = torch.stack([data[i:i+seq_len] for i in ix])
-    y = torch.stack([data[i+1:i+seq_len+1] for i in ix])
-    return x.to(device, dtype=torch.long), y.to(device, dtype=torch.long)
+    ix = np.random.randint(0, len(data) - seq_len - 1, size=batch_size)
+    x = np.stack([data[i:i + seq_len] for i in ix]).astype(np.int64)
+    y = np.stack([data[i + 1:i + seq_len + 1] for i in ix]).astype(np.int64)
+    return torch.from_numpy(x).to(device), torch.from_numpy(y).to(device)
 
 def train():
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -31,26 +30,29 @@ def train():
     # ----------------------------------------------------------------
     SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
     ROOT_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, "../../"))
-    DATA_PATH = os.path.join(ROOT_DIR, "data", "train.bin")
+    DATA_PATH = os.environ.get("SSM_DATA_PATH", os.path.join(ROOT_DIR, "data", "train.bin"))
     
     # ----------------------------------------------------------------
-    # HYPERPARAMETERS (Max Memory Profile: ~44-48 GB VRAM Utilization)
+    # HYPERPARAMETERS
     # ----------------------------------------------------------------
-    # This configuration maximizes the context window to 512 tokens (2x original)
-    # while utilizing ~44 GB of your 64 GB unified memory without triggering OS swap/OOM.
+    # Environment overrides make it possible to benchmark larger models
+    # without changing the default checkpoint-compatible configuration.
     # ----------------------------------------------------------------
-    BATCH_SIZE = 4       # Micro-batch size (4 * 512 tokens = 2,048 tokens per forward pass)
-    ACCUM_STEPS = 4      # 4 * 4 = 16 Effective Batch Size (frequent updates & fast tracking)
+    BATCH_SIZE = int(os.environ.get("SSM_BATCH_SIZE", "4"))
+    ACCUM_STEPS = int(os.environ.get("SSM_ACCUM_STEPS", "4"))
     SEQ_LEN = 512        # 2x longer context window (512 tokens)
-    DIM = 512            # Model dimension (72.5M total parameters)
-    NUM_LAYERS = 8       # 8 layers for deep syntax and long-range semantic representation
+    DIM = int(os.environ.get("SSM_DIM", "512"))
+    NUM_LAYERS = int(os.environ.get("SSM_LAYERS", "8"))
     EPOCHS = 4           # 4 full epochs (~11.5 hours, ideal overnight run)
     vocab_size = 50304
     
     # 1. Load the Dataset
     print(f"Loading data from {DATA_PATH}...")
-    raw_data = np.fromfile(DATA_PATH, dtype=np.uint16)
-    data = torch.from_numpy(raw_data).long()
+    data = np.memmap(DATA_PATH, dtype=np.uint16, mode="r")
+    if len(data) <= SEQ_LEN + 1:
+        raise ValueError("Training token file is shorter than one sequence")
+    if int(data.max()) >= vocab_size:
+        raise ValueError("Training token file contains IDs outside the model vocabulary")
     
     # 2. Calculate Workload
     tokens_per_epoch = len(data)
@@ -59,12 +61,24 @@ def train():
     total_update_steps = updates_per_epoch * EPOCHS
 
     model = PureSSMLanguageModel(vocab_size, DIM, NUM_LAYERS).to(device)
+    model.gradient_checkpointing = os.environ.get("SSM_CHECKPOINT_BLOCKS", "0") == "1"
+    use_fused_loss = os.environ.get("SSM_FUSED_LOSS", "0") == "1"
+    fused_loss = None
+    if use_fused_loss:
+        try:
+            from liger_kernel.transformers.fused_linear_cross_entropy import LigerFusedLinearCrossEntropyLoss
+        except ImportError as exc:
+            raise RuntimeError("SSM_FUSED_LOSS=1 requires liger-kernel") from exc
+        fused_loss = LigerFusedLinearCrossEntropyLoss()
+        print("Liger fused linear cross-entropy enabled")
+    if model.gradient_checkpointing:
+        print("Block activation checkpointing enabled")
 
     # ---------------------------------------------------------
     # CHECKPOINT RESUME (Build off previous training runs)
     # ---------------------------------------------------------
     start_completed_updates = 0
-    CKPT_DIR = os.path.join(ROOT_DIR, "pure_ssm_ckpt")
+    CKPT_DIR = os.environ.get("SSM_CKPT_DIR", os.path.join(ROOT_DIR, "pure_ssm_ckpt"))
     latest_ckpt_path = os.path.join(CKPT_DIR, "latest_checkpoint.pt")
     ckpt = None
     if os.path.exists(latest_ckpt_path):
@@ -83,8 +97,8 @@ def train():
     # ---------------------------------------------------------
     # --- COMPILATION (Safe Triton / TorchInductor Fallback) ---
     # ---------------------------------------------------------
-    # On Jetson Orin (aarch64), Triton is typically not available,
-    # so eager PyTorch CUDA with TF32 cuBLAS runs directly and reliably.
+    # This controls the surrounding PyTorch model only. The SSM scan can use
+    # Triton independently whenever Triton is importable on CUDA.
     COMPILE = False
     if COMPILE and device == "cuda":
         try:
@@ -94,7 +108,7 @@ def train():
         except Exception as e:
             print(f"Skipping torch.compile ({e}); running eager PyTorch CUDA.")
     else:
-        print("Running native PyTorch CUDA execution (optimized TF32 cuBLAS).")
+        print("Running without torch.compile; SSM scan selects Triton when available.")
     
     print(f"Total Model Parameters: {sum(p.numel() for p in model.parameters()):,}")
     print(f"Tokens in Dataset:      {tokens_per_epoch:,}")
@@ -121,7 +135,16 @@ def train():
             max_learning_rate = pgs[0]['max_lr']
             print(f"[*] Loaded checkpoint max learning rate: {max_learning_rate}")
 
-    optimizer = optim.AdamW(optim_groups, lr=max_learning_rate, betas=(0.9, 0.95), fused=True)
+    optimizer_name = os.environ.get("SSM_OPTIMIZER", "adamw").lower()
+    if optimizer_name not in ("adamw", "adafactor"):
+        raise ValueError("SSM_OPTIMIZER must be 'adamw' or 'adafactor'")
+    if ckpt and isinstance(ckpt, dict) and ckpt.get("optimizer_name", "adamw") != optimizer_name:
+        raise ValueError("Checkpoint optimizer differs from SSM_OPTIMIZER; use a new SSM_CKPT_DIR")
+    if optimizer_name == "adafactor":
+        optimizer = optim.Adafactor(optim_groups, lr=max_learning_rate)
+    else:
+        optimizer = optim.AdamW(optim_groups, lr=max_learning_rate, betas=(0.9, 0.95), fused=True)
+    print(f"Optimizer: {optimizer_name}")
     
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer, 
@@ -129,14 +152,15 @@ def train():
         total_steps=total_update_steps,
         pct_start=0.08,                  # 8% warmup (~93 steps)
         div_factor=10.0,                 
-        final_div_factor=10.0
+        final_div_factor=10.0,
+        cycle_momentum=optimizer_name == "adamw",
     )
 
     # Restore optimizer state and scheduler if resuming
     if ckpt and isinstance(ckpt, dict) and 'optimizer_state_dict' in ckpt:
         try:
             optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-            print("[*] Restored AdamW optimizer states!")
+            print(f"[*] Restored {optimizer_name} optimizer states!")
         except Exception as e:
             print(f"[*] Starting fresh optimizer states ({e})")
             
@@ -185,8 +209,12 @@ def train():
             
             # --- BFLOAT16 Forward Pass ---
             with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                logits = model(x)
-                loss = nn.functional.cross_entropy(logits.view(-1, vocab_size), y.view(-1))
+                if fused_loss is not None:
+                    hidden = model.forward_hidden(x)
+                    loss = fused_loss(model.classifier.weight, hidden.reshape(-1, DIM), y.reshape(-1))
+                else:
+                    logits = model(x)
+                    loss = nn.functional.cross_entropy(logits.view(-1, vocab_size), y.view(-1))
                 loss = loss / ACCUM_STEPS
             
             # --- Backward Pass ---
@@ -223,6 +251,7 @@ def train():
                         'epoch': epoch + 1,
                         'completed_updates': completed_updates,
                         'model_state_dict': model.state_dict(),
+                        'optimizer_name': optimizer_name,
                         'optimizer_state_dict': optimizer.state_dict(),
                         'scheduler_state_dict': scheduler.state_dict(),
                         'loss': step_loss,
@@ -239,6 +268,7 @@ def train():
             'epoch': epoch + 1,
             'completed_updates': completed_updates,
             'model_state_dict': model.state_dict(),
+            'optimizer_name': optimizer_name,
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
             'loss': epoch_loss / max(1, micro_batches_per_epoch),

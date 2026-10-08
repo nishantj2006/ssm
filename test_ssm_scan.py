@@ -74,12 +74,25 @@ class SSMScanTests(unittest.TestCase):
                                     if p.grad is not None))
                 opt.step()
 
+    def test_block_checkpointing_preserves_gradients(self):
+        for original in (PureSSMLanguageModel(64, 32, 2),
+                         HybridLanguageModel(64, 32, 3, attn_layers=(1,))):
+            with self.subTest(model=type(original).__name__):
+                checkpointed = copy.deepcopy(original)
+                checkpointed.gradient_checkpointing = True
+                tokens = torch.randint(64, (2, 8))
+                original(tokens).sum().backward()
+                checkpointed(tokens).sum().backward()
+                for a, b in zip(original.parameters(), checkpointed.parameters()):
+                    self.assertTrue(torch.allclose(a.grad, b.grad, atol=1e-5, rtol=1e-5))
+
     @unittest.skipUnless(triton is not None and torch.cuda.is_available(), "CUDA Triton unavailable")
     def test_triton_matches_dense(self):
         for length, dim, dtype in ((1, 17, torch.float32),
                                    (7, 32, torch.float32),
                                    (65, 17, torch.float32),
-                                   (129, 32, torch.bfloat16)):
+                                   (129, 32, torch.bfloat16),
+                                   (1025, 17, torch.float32)):
             with self.subTest(length=length, dim=dim, dtype=dtype):
                 self.compare("cuda", length, dim, dtype, "triton", dense_reference_scan)
 
